@@ -1,0 +1,259 @@
+# Philakone EMA (8,13,21,55,200) — Binance SPOT live 1H Telegram bot
+# Python 3.10+
+# Hosting secrets: TELEGRAM_BOT_TOKEN(9200084235:AAE7US0cyIXTQ1c1pcl74hJZ_R6KFnFYQB8). Chat ID is learned automatically
+# after the user opens the bot and sends /start.
+
+import os, time, sqlite3, threading, logging
+from io import BytesIO
+from datetime import datetime, timezone
+
+import requests
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.patches import Rectangle
+from flask import Flask, jsonify
+
+COINS = [
+    'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'BNBUSDT',
+    'DOGEUSDT', 'NEARUSDT', 'TRXUSDT', 'LINKUSDT', 'ADAUSDT'
+]
+TIMEFRAME = '1h'                 # only 1H
+POLL_SECONDS = 20                # watch the currently forming candle
+HEARTBEAT_SECONDS = 30 * 60      # Telegram active message every 30 minutes
+EXPONENTIAL_MA = True            # True=EMA, False=SMA (TradingView setting)
+BINANCE_KLINES = 'https://api.binance.com/api/v3/klines'
+BINANCE_PRICE = 'https://api.binance.com/api/v3/ticker/price'
+TELEGRAM_BASE = 'https://api.telegram.org/bot{}'
+DB_PATH = os.getenv('STATE_DB', 'spot_ema_state.db')
+TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', 'PASTE_YOUR_BOT_TOKEN_HERE').strip()
+CHAT_ID_SETTING = os.getenv('TELEGRAM_CHAT_ID', '').strip()  # optional numeric chat ID; or send /start to the bot
+if not TOKEN or TOKEN == 'PASTE_YOUR_BOT_TOKEN_HERE':
+    raise RuntimeError('Paste your Telegram Bot Token into TOKEN or set TELEGRAM_BOT_TOKEN.')
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+log = logging.getLogger('spot-ema-bot')
+s = requests.Session()
+s.headers.update({'User-Agent': 'Spot-EMA-Live-Bot/1.2'})
+app = Flask(__name__)
+chat_id = int(CHAT_ID_SETTING) if CHAT_ID_SETTING.lstrip('-').isdigit() else None
+telegram_offset = 0
+
+
+def api(method, **kwargs):
+    r = s.post(TELEGRAM_BASE.format(TOKEN) + '/' + method, data=kwargs, timeout=35)
+    r.raise_for_status()
+    data = r.json()
+    if not data.get('ok'):
+        raise RuntimeError(f'Telegram {method} failed: {data}')
+    return data['result']
+
+
+def send_text(text):
+    if chat_id is None:
+        log.info('Telegram chat not connected yet; open bot and send /start')
+        return
+    api('sendMessage', chat_id=chat_id, text=text, disable_web_page_preview='true')
+
+
+def send_photo(png, caption):
+    if chat_id is None:
+        return
+    r = s.post(TELEGRAM_BASE.format(TOKEN) + '/sendPhoto',
+               data={'chat_id': chat_id, 'caption': caption},
+               files={'photo': ('signal_chart.png', png, 'image/png')}, timeout=50)
+    r.raise_for_status()
+    data = r.json()
+    if not data.get('ok'):
+        raise RuntimeError(f'Telegram sendPhoto failed: {data}')
+
+
+def db_init():
+    with sqlite3.connect(DB_PATH, timeout=30) as c:
+        c.execute("CREATE TABLE IF NOT EXISTS signal_state (symbol TEXT PRIMARY KEY, candle_ms INTEGER NOT NULL, signal TEXT, active INTEGER NOT NULL DEFAULT 0)")
+        c.commit()
+
+
+def poll_telegram_updates():
+    global chat_id, telegram_offset
+    # getUpdates requires webhook off; deleteWebhook is safe for a polling bot.
+    try:
+        r = s.get(TELEGRAM_BASE.format(TOKEN) + '/getUpdates',
+                  params={'offset': telegram_offset, 'timeout': 1}, timeout=8)
+        r.raise_for_status()
+        data = r.json()
+        if not data.get('ok'):
+            return
+        for update in data.get('result', []):
+            telegram_offset = max(telegram_offset, int(update['update_id']) + 1)
+            msg = update.get('message') or update.get('edited_message')
+            if not msg:
+                continue
+            text = (msg.get('text') or '').strip().lower()
+            sender_chat = msg.get('chat', {})
+            if text.startswith('/start') or text.startswith('/connect'):
+                chat_id = sender_chat.get('id')
+                if chat_id is not None:
+                    send_text('BOT CONNECTED — میں فعال ہوں\nBinance SPOT | 1H | 10 coins\nLive candle signals enabled.')
+                    log.info('Telegram chat connected: %s', chat_id)
+    except Exception as e:
+        log.warning('Telegram update polling: %s', e)
+
+
+def fetch_live_candles(symbol):
+    r = s.get(BINANCE_KLINES, params={'symbol': symbol, 'interval': TIMEFRAME, 'limit': 250}, timeout=25)
+    r.raise_for_status()
+    raw = r.json()
+    if not isinstance(raw, list) or len(raw) < 205:
+        raise RuntimeError(f'Not enough candle history for {symbol}')
+    cols = ['open_time','open','high','low','close','volume','close_time','quote_volume','trades','taker_buy_base','taker_buy_quote','ignore']
+    df = pd.DataFrame(raw, columns=cols)
+    for col in ['open','high','low','close','volume']:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    df['open_time'] = pd.to_datetime(df['open_time'], unit='ms', utc=True)
+    df['close_time'] = pd.to_numeric(df['close_time'], errors='coerce').astype('int64')
+    # Keep Binance's final, currently-forming 1H candle: user requested live signals.
+    return df.reset_index(drop=True)
+
+
+def add_mas(df):
+    close = df['close']
+    for n in [8,13,21,55,200]:
+        if EXPONENTIAL_MA:
+            df[f'ma{n}'] = close.ewm(span=n, adjust=False).mean()
+        else:
+            df[f'ma{n}'] = close.rolling(n, min_periods=n).mean()
+    return df
+
+
+def live_signal(df):
+    # Pine cross(ma21,ma55) on the live bar, compared with the prior bar.
+    prev, cur = df.iloc[-2], df.iloc[-1]
+    crossed_up = cur.ma21 > cur.ma55 and prev.ma21 <= prev.ma55
+    crossed_down = cur.ma21 < cur.ma55 and prev.ma21 >= prev.ma55
+    if crossed_up and cur.ma8 > cur.ma13 and cur.ma21 > cur.ma55:
+        return 'BUY'
+    if crossed_down and cur.ma8 < cur.ma13 and cur.ma21 < cur.ma55:
+        return 'SELL'
+    return None
+
+
+def current_spot_price(symbol):
+    r = s.get(BINANCE_PRICE, params={'symbol': symbol}, timeout=15)
+    r.raise_for_status()
+    return float(r.json()['price'])
+
+
+def chart_png(df, symbol, signal):
+    view = df.tail(100).copy().reset_index(drop=True)
+    x = mdates.date2num(view.open_time.dt.to_pydatetime())
+    width = 0.028
+    fig, ax = plt.subplots(figsize=(12,7), dpi=145)
+    fig.patch.set_facecolor('#10151d'); ax.set_facecolor('#10151d')
+    for spine in ax.spines.values(): spine.set_color('#536171')
+    ax.tick_params(colors='#d5dce5', labelsize=8)
+    ax.grid(True, color='#34404d', alpha=.55, linewidth=.6)
+    for j,row in view.iterrows():
+        color = '#22c55e' if row.close >= row.open else '#ef4444'
+        ax.vlines(x[j], row.low, row.high, color=color, linewidth=.8)
+        lo=min(row.open,row.close); h=max(abs(row.close-row.open), max(row.close*.00003,1e-8))
+        ax.add_patch(Rectangle((x[j]-width/2,lo),width,h,facecolor=color,edgecolor=color,linewidth=.5))
+    colors={8:'#3b82f6',13:'#22c55e',21:'#facc15',55:'#ef4444',200:'#e5e7eb'}
+    for n,color in colors.items(): ax.plot(x,view[f'ma{n}'],color=color,linewidth=1.15,label=str(n))
+    last=view.iloc[-1]
+    if signal:
+        y=last.low*.998 if signal=='BUY' else last.high*1.002
+        ax.scatter([x[-1]],[y],marker='^' if signal=='BUY' else 'v',s=150,color=colors[13] if signal=='BUY' else colors[55],edgecolors='white',zorder=8)
+        ax.annotate(signal,(x[-1],y),xytext=(0,12 if signal=='BUY' else -20),textcoords='offset points',ha='center',color='white',fontsize=10,fontweight='bold')
+    ax.set_title(f'{symbol} | BINANCE SPOT | LIVE 1H | Philakone EMA 8/13/21/55/200',color='white',fontsize=11,pad=12)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M',tz=timezone.utc))
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=5,maxticks=9,tz=timezone.utc))
+    fig.autofmt_xdate(rotation=20); ax.set_ylabel('Price (USDT)',color='#d5dce5')
+    ax.legend(loc='upper left',ncol=5,fontsize=8,facecolor='#1c2530',edgecolor='#536171',labelcolor='white',title='MA')
+    fig.tight_layout(); b=BytesIO(); fig.savefig(b,format='png',facecolor=fig.get_facecolor(),bbox_inches='tight'); plt.close(fig); b.seek(0)
+    return b.getvalue()
+
+
+def spot_url(symbol):
+    base=symbol[:-4]
+    return f'https://www.binance.com/en/trade/{base}_USDT?type=spot'
+
+
+def price_str(price):
+    return f'{price:,.8f}'.rstrip('0').rstrip('.')
+
+
+def handle_symbol(symbol):
+    df = add_mas(fetch_live_candles(symbol))
+    signal = live_signal(df)
+    candle_ms = int(df.iloc[-1].open_time.timestamp() * 1000)
+
+    with sqlite3.connect(DB_PATH, timeout=30) as c:
+        row = c.execute(
+            'SELECT candle_ms, signal, active FROM signal_state WHERE symbol=?',
+            (symbol,)
+        ).fetchone()
+
+        # Signal absent: mark inactive silently. If it forms again later,
+        # including in the same live candle, send a fresh alert.
+        if not signal:
+            c.execute("INSERT INTO signal_state(symbol,candle_ms,signal,active) VALUES(?,?,NULL,0) "
+                      "ON CONFLICT(symbol) DO UPDATE SET candle_ms=excluded.candle_ms, signal=NULL, active=0",
+                      (symbol, candle_ms))
+            c.commit()
+            return
+
+        # Avoid repeat messages while the same signal stays continuously active.
+        if row and int(row[0]) == candle_ms and row[1] == signal and int(row[2]) == 1:
+            return
+
+        c.execute("INSERT INTO signal_state(symbol,candle_ms,signal,active) VALUES(?,?,?,1) "
+                  "ON CONFLICT(symbol) DO UPDATE SET candle_ms=excluded.candle_ms, signal=excluded.signal, active=1",
+                  (symbol, candle_ms, signal))
+        c.commit()
+
+    price = current_spot_price(symbol)
+    candle_time = df.iloc[-1].open_time.strftime('%Y-%m-%d %H:%M UTC')
+    caption = (f'{signal} SIGNAL — BINANCE SPOT\nCoin: {symbol}\n'
+               f'Timeframe: 1H (LIVE candle)\n'
+               f'Entry/reference price: {price_str(price)} USDT\n'
+               f'Candle started: {candle_time}\n'
+               f'Indicator: Philakone MA 8/13/21/55/200\n'
+               f'Spot chart: {spot_url(symbol)}')
+    send_photo(chart_png(df, symbol, signal), caption)
+    log.info('Sent LIVE %s %s at %s', signal, symbol, price_str(price))
+
+
+def bot_loop():
+    global chat_id
+    db_init()
+    try:
+        # Start clean polling; user must open bot and send /start once.
+        s.get(TELEGRAM_BASE.format(TOKEN)+'/deleteWebhook',params={'drop_pending_updates':'false'},timeout=10)
+    except Exception as e: log.warning('deleteWebhook: %s',e)
+    last_heartbeat=time.monotonic()
+    send_text('BOT ACTIVE — میں فعال ہوں\nBinance SPOT | LIVE 1H | 10 coins')
+    while True:
+        poll_telegram_updates()
+        for symbol in COINS:
+            try: handle_symbol(symbol)
+            except Exception as e: log.exception('Error for %s: %s',symbol,e)
+            time.sleep(1.0)
+        if chat_id is not None and time.monotonic()-last_heartbeat>=HEARTBEAT_SECONDS:
+            try: send_text('BOT ACTIVE — میں فعال ہوں\nBinance SPOT | LIVE 1H | 10 coins')
+            except Exception as e: log.warning('Heartbeat failed: %s',e)
+            last_heartbeat=time.monotonic()
+        time.sleep(max(1,POLL_SECONDS-len(COINS)))
+
+
+@app.get('/')
+def home(): return 'Spot EMA Telegram Bot is running. Open Telegram bot and send /start.\n',200
+
+@app.get('/health')
+def health(): return jsonify(status='active',market='Binance Spot',timeframe='1H live candle',coins=COINS),200
+
+if __name__=='__main__':
+    threading.Thread(target=bot_loop,daemon=True,name='spot-ema-loop').start()
+    app.run(host='0.0.0.0',port=int(os.getenv('PORT','10000')),use_reloader=False)
